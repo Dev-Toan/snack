@@ -43,13 +43,16 @@ function GameBoard({ size, snake, food }: Props) {
     <View style={[styles.canvas, { width: size, height: size, backgroundColor: COLORS.board }]}>
       <Grid size={size} />
 
-      {/* Thân rắn: đầu vẽ sau cùng để nằm trên. */}
+      {/* Thân rắn: đầu vẽ sau cùng để nằm trên.
+          Key theo toạ độ ô: thân rắn không "trôi", mỗi bước chỉ thêm một đốt ở
+          đầu và bớt một đốt ở đuôi, nên React chỉ tạo/huỷ hai View thay vì
+          tạo lại toàn bộ. Không trùng key vì rắn không bao giờ tự chồng lên mình. */}
       {snake.map((seg, idx) => {
         const isHead = idx === 0;
         const s = cell - pad * 2;
         return (
           <View
-            key={`s${seg.x}-${seg.y}-${idx}`}
+            key={`${seg.x},${seg.y}`}
             style={{
               position: 'absolute',
               left: seg.x * cell + pad,

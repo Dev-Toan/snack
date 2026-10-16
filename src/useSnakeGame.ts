@@ -1,16 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {
-  START_TICK_MS,
-  MIN_TICK_MS,
-  SPEEDUP_EVERY,
-  SPEEDUP_STEP_MS,
-  STORAGE_KEY_BEST,
-  isOpposite,
-  type Direction,
-  type Point,
-} from './constants';
-import { initialSnake, spawnFood, stepSnake, resolveDirection } from './engine';
+import { STORAGE_KEY_BEST, type Direction, type Point } from './constants';
+import { createSim, enqueueDirection, runFrame, type Sim } from './loop';
 
 export type GameStatus = 'idle' | 'running' | 'paused' | 'over';
 
@@ -22,50 +14,48 @@ export type GameState = {
   status: GameStatus;
 };
 
-// Số lệnh hướng tối đa được đệm (đi trước rắn) để bấm nhanh không bị mất.
-const MAX_INPUT_BUFFER = 2;
-// Chặn "vòng xoáy tử thần": không dồn quá ngần này bước trong một khung hình
-// khi máy giật/lag khiến delta thời gian nhảy vọt.
-const MAX_STEPS_PER_FRAME = 5;
-
-function tickForScore(score: number): number {
-  const steps = Math.floor(score / SPEEDUP_EVERY);
-  return Math.max(MIN_TICK_MS, START_TICK_MS - steps * SPEEDUP_STEP_MS);
-}
-
+// Hook nối mô phỏng thuần (loop.ts) với React: chạy requestAnimationFrame,
+// đẩy kết quả sang state để vẽ, lưu kỷ lục và tự tạm dừng khi app xuống nền.
 export function useSnakeGame() {
-  const [state, setState] = useState<GameState>(() => {
-    const snake = initialSnake();
-    return {
-      snake,
-      food: spawnFood(snake),
-      score: 0,
-      best: 0,
-      status: 'idle',
-    };
-  });
+  // Trạng thái mô phỏng "chuẩn" nằm trong ref và được cập nhật đồng bộ ngay
+  // trong vòng lặp, không chờ React render. Nhờ vậy một khung hình chạy nhiều
+  // bước (sau giật lag) vẫn đúng và hàng đợi lệnh không bị rút oan.
+  const [initialSim] = useState(() => createSim());
+  const simRef = useRef<Sim>(initialSim);
+  const bestRef = useRef(0);
 
-  // Hướng hiện tại + hàng đợi lệnh hướng (tối đa MAX_INPUT_BUFFER).
-  const dirRef = useRef<Direction>('right');
-  const queueRef = useRef<Direction[]>([]);
-  const stateRef = useRef(state);
-  stateRef.current = state;
+  const [state, setState] = useState<GameState>(() => ({
+    snake: initialSim.snake,
+    food: initialSim.food,
+    score: 0,
+    best: 0,
+    status: 'idle',
+  }));
 
-  // Trạng thái vòng lặp delta-time.
   const rafRef = useRef<number | null>(null);
   const lastTimeRef = useRef<number | null>(null);
-  const accRef = useRef(0);
 
   // Nạp kỷ lục đã lưu khi mở app.
   useEffect(() => {
     AsyncStorage.getItem(STORAGE_KEY_BEST)
       .then((v) => {
         const best = v ? parseInt(v, 10) : 0;
-        if (!Number.isNaN(best) && best > 0) {
-          setState((s) => ({ ...s, best }));
+        if (!Number.isNaN(best) && best > bestRef.current) {
+          bestRef.current = best;
+          setState((s) => ({ ...s, best: Math.max(s.best, best) }));
         }
       })
       .catch(() => {});
+  }, []);
+
+  // Tự tạm dừng khi app xuống nền (chuyển app, khoá màn hình, kéo thông báo).
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next !== 'active') {
+        setState((s) => (s.status === 'running' ? { ...s, status: 'paused' } : s));
+      }
+    });
+    return () => sub.remove();
   }, []);
 
   const cancelLoop = useCallback(() => {
@@ -74,86 +64,46 @@ export function useSnakeGame() {
       rafRef.current = null;
     }
     lastTimeRef.current = null;
-    accRef.current = 0;
   }, []);
 
-  // Một bước logic: lấy lệnh kế trong hàng đợi, di chuyển, cập nhật state.
-  // Trả về false nếu game vừa kết thúc (để vòng lặp dừng lại).
-  const advance = useCallback((): boolean => {
-    const cur = stateRef.current;
+  // Một khung hình: giao thời gian trôi qua cho mô phỏng, rồi đồng bộ kết quả
+  // sang state React (tối đa một setState mỗi khung hình).
+  const frame = useCallback((now: number) => {
+    if (lastTimeRef.current == null) lastTimeRef.current = now;
+    const dt = now - lastTimeRef.current;
+    lastTimeRef.current = now;
 
-    // Áp dụng một lệnh hướng đã đệm (nếu hợp lệ so với hướng hiện tại).
-    const queued = queueRef.current.shift();
-    dirRef.current = resolveDirection(dirRef.current, queued);
+    const { sim, steps } = runFrame(simRef.current, dt);
+    simRef.current = sim;
 
-    const res = stepSnake(cur.snake, dirRef.current, cur.food);
-    if (res.dead) {
-      setState((s) => ({ ...s, status: 'over' }));
-      return false;
-    }
-
-    if (res.ate) {
-      const newScore = cur.score + 1;
-      const newBest = Math.max(cur.best, newScore);
-      if (newBest !== cur.best) {
-        AsyncStorage.setItem(STORAGE_KEY_BEST, String(newBest)).catch(() => {});
+    if (steps > 0) {
+      if (sim.score > bestRef.current) {
+        bestRef.current = sim.score;
+        AsyncStorage.setItem(STORAGE_KEY_BEST, String(sim.score)).catch(() => {});
       }
+      const best = bestRef.current;
       setState((s) => ({
         ...s,
-        snake: res.snake,
-        food: spawnFood(res.snake),
-        score: newScore,
-        best: newBest,
+        snake: sim.snake,
+        food: sim.food,
+        score: sim.score,
+        best,
+        status: sim.dead ? 'over' : s.status,
       }));
-    } else {
-      setState((s) => ({ ...s, snake: res.snake }));
     }
-    return true;
+
+    if (sim.dead) {
+      rafRef.current = null;
+      return;
+    }
+    rafRef.current = requestAnimationFrame(frame);
   }, []);
-
-  // Vòng lặp delta-time: gom thời gian trôi qua, chạy đủ số bước tương ứng
-  // nhịp hiện tại. Tốc độ game không phụ thuộc tần số khung hình của máy.
-  const frame = useCallback(
-    (now: number) => {
-      if (lastTimeRef.current == null) lastTimeRef.current = now;
-      const dt = now - lastTimeRef.current;
-      lastTimeRef.current = now;
-      accRef.current += dt;
-
-      let steps = 0;
-      let alive = true;
-      // tickForScore đọc điểm hiện tại nên tính lại sau mỗi bước (có thể vừa tăng tốc).
-      while (alive && accRef.current >= tickForScore(stateRef.current.score)) {
-        accRef.current -= tickForScore(stateRef.current.score);
-        alive = advance();
-        steps++;
-        if (steps >= MAX_STEPS_PER_FRAME) {
-          accRef.current = 0; // bỏ phần dư, tránh dồn bước khi lag
-          break;
-        }
-      }
-
-      if (alive) {
-        rafRef.current = requestAnimationFrame(frame);
-      } else {
-        rafRef.current = null;
-      }
-    },
-    [advance]
-  );
 
   const start = useCallback(() => {
     cancelLoop();
-    const snake = initialSnake();
-    dirRef.current = 'right';
-    queueRef.current = [];
-    setState((s) => ({
-      ...s,
-      snake,
-      food: spawnFood(snake),
-      score: 0,
-      status: 'running',
-    }));
+    const sim = createSim();
+    simRef.current = sim;
+    setState((s) => ({ ...s, snake: sim.snake, food: sim.food, score: 0, status: 'running' }));
   }, [cancelLoop]);
 
   const togglePause = useCallback(() => {
@@ -164,22 +114,17 @@ export function useSnakeGame() {
     });
   }, []);
 
-  // Người chơi đổi hướng: đệm vào hàng đợi (tối đa MAX_INPUT_BUFFER).
-  // Chặn quay đầu 180 độ và lệnh trùng, so với lệnh cuối cùng đang chờ.
+  // Người chơi đổi hướng: đệm vào mô phỏng (luật đệm xem enqueueDirection).
   const changeDirection = useCallback((next: Direction) => {
-    const q = queueRef.current;
-    if (q.length >= MAX_INPUT_BUFFER) return;
-    const active = q.length > 0 ? q[q.length - 1] : dirRef.current;
-    if (next === active || isOpposite(next, active)) return;
-    q.push(next);
+    simRef.current = enqueueDirection(simRef.current, next);
   }, []);
 
-  // Khởi động / dừng vòng lặp theo trạng thái. Reset nhịp khi (tái) chạy để
-  // không dồn thời gian đã trôi lúc đang tạm dừng hoặc ở màn chờ.
+  // Khởi động / dừng vòng lặp theo trạng thái. Khi (tái) chạy thì bỏ thời gian
+  // đã tích lũy để không dồn bước ngay sau lúc tạm dừng hoặc ở màn chờ.
   useEffect(() => {
     if (state.status === 'running') {
       lastTimeRef.current = null;
-      accRef.current = 0;
+      simRef.current = { ...simRef.current, acc: 0 };
       rafRef.current = requestAnimationFrame(frame);
       return cancelLoop;
     }

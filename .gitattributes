@@ -1,0 +1,4 @@
+# Chuẩn hoá LF cả trong repo lẫn khi checkout, tránh cảnh báo CRLF trên Windows.
+* text=auto eol=lf
+*.png binary
+*.wav binary

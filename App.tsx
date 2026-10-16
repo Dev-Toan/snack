@@ -6,8 +6,7 @@ import {
   Pressable,
   useWindowDimensions,
   PanResponder,
-  GestureResponderEvent,
-  PanResponderGestureState,
+  type PanResponderGestureState,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
@@ -23,6 +22,18 @@ export default function App() {
   );
 }
 
+// Ngón tay phải đi quá ngần này px thì mới tính là vuốt (lọc rung tay).
+const SWIPE_THRESHOLD_PX = 12;
+
+function exceedsSwipeThreshold(g: PanResponderGestureState): boolean {
+  return Math.abs(g.dx) > SWIPE_THRESHOLD_PX || Math.abs(g.dy) > SWIPE_THRESHOLD_PX;
+}
+
+function swipeDirection(g: PanResponderGestureState): Direction {
+  if (Math.abs(g.dx) > Math.abs(g.dy)) return g.dx > 0 ? 'right' : 'left';
+  return g.dy > 0 ? 'down' : 'up';
+}
+
 function Game() {
   const { width, height } = useWindowDimensions();
   const { state, start, togglePause, changeDirection } = useSnakeGame();
@@ -34,20 +45,27 @@ function Game() {
     return Math.floor(Math.min(maxByWidth, maxByHeight));
   }, [width, height]);
 
-  // Vuốt để đổi hướng.
-  const panResponder = useRef(
-    PanResponder.create({
-      onMoveShouldSetPanResponder: (_e, g) =>
-        Math.abs(g.dx) > 12 || Math.abs(g.dy) > 12,
-      onPanResponderRelease: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
-        if (Math.abs(g.dx) > Math.abs(g.dy)) {
-          changeDirection(g.dx > 0 ? 'right' : 'left');
-        } else {
-          changeDirection(g.dy > 0 ? 'down' : 'up');
-        }
-      },
-    })
-  ).current;
+  // Vuốt để đổi hướng. Nhận cử chỉ ngay từ lúc đặt tay (các nút Pressable bên
+  // trong vẫn được ưu tiên) và chốt hướng ngay khi ngón tay đi đủ xa, không
+  // đợi nhấc tay, để giảm độ trễ. Mỗi cú chạm chỉ sinh đúng một lệnh.
+  const swipedRef = useRef(false);
+  const panResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        // Cho phép giành cử chỉ nếu người chơi vuốt bắt đầu từ một nút overlay.
+        onMoveShouldSetPanResponder: (_e, g) => exceedsSwipeThreshold(g),
+        onPanResponderGrant: () => {
+          swipedRef.current = false;
+        },
+        onPanResponderMove: (_e, g) => {
+          if (swipedRef.current || !exceedsSwipeThreshold(g)) return;
+          swipedRef.current = true;
+          changeDirection(swipeDirection(g));
+        },
+      }),
+    [changeDirection]
+  );
 
   const showOverlay = state.status === 'idle' || state.status === 'over';
 
@@ -125,24 +143,27 @@ function DPad({ onPress }: { onPress: (d: Direction) => void }) {
   return (
     <View style={styles.dpad}>
       <View style={styles.dpadRow}>
-        <ArrowBtn label="↑" onPress={() => onPress('up')} />
+        <ArrowBtn label="↑" name="Lên" onPress={() => onPress('up')} />
       </View>
       <View style={styles.dpadRow}>
-        <ArrowBtn label="←" onPress={() => onPress('left')} />
+        <ArrowBtn label="←" name="Trái" onPress={() => onPress('left')} />
         <View style={styles.arrowSpacer} />
-        <ArrowBtn label="→" onPress={() => onPress('right')} />
+        <ArrowBtn label="→" name="Phải" onPress={() => onPress('right')} />
       </View>
       <View style={styles.dpadRow}>
-        <ArrowBtn label="↓" onPress={() => onPress('down')} />
+        <ArrowBtn label="↓" name="Xuống" onPress={() => onPress('down')} />
       </View>
     </View>
   );
 }
 
-function ArrowBtn({ label, onPress }: { label: string; onPress: () => void }) {
+function ArrowBtn({ label, name, onPress }: { label: string; name: string; onPress: () => void }) {
+  // onPressIn: nhận lệnh ngay lúc chạm, không đợi nhấc tay.
   return (
     <Pressable
-      onPress={onPress}
+      onPressIn={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={name}
       style={({ pressed }) => [styles.arrow, pressed && styles.arrowPressed]}
     >
       <Text style={styles.arrowText}>{label}</Text>
